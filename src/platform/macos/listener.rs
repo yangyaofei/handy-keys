@@ -271,6 +271,29 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
                 let changed_modifier = keycode_to_modifier(keycode);
 
+                // Reconcile the tracked modifier state against the event's `flags`, which is the
+                // OS ground truth. `reconcile_modifiers()` only runs on non-FlagsChanged events,
+                // so an app whose flow is "Cmd+V paste, then press a modifier-only hotkey" never
+                // runs it. If a modifier release is lost (tap disabled by timeout, secure input,
+                // lock screen, ...) the stale bit stays forever and modifier-only hotkeys stop
+                // matching.
+                {
+                    let mut m = state.current_modifiers;
+                    if flags.contains(CGEventFlags::MaskCommand) {
+                        if !m.intersects(Modifiers::CMD) { m |= Modifiers::CMD_LEFT; }
+                    } else { m &= !(Modifiers::CMD_LEFT | Modifiers::CMD_RIGHT); }
+                    if flags.contains(CGEventFlags::MaskShift) {
+                        if !m.intersects(Modifiers::SHIFT) { m |= Modifiers::SHIFT_LEFT; }
+                    } else { m &= !(Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT); }
+                    if flags.contains(CGEventFlags::MaskControl) {
+                        if !m.intersects(Modifiers::CTRL) { m |= Modifiers::CTRL_LEFT; }
+                    } else { m &= !(Modifiers::CTRL_LEFT | Modifiers::CTRL_RIGHT); }
+                    if flags.contains(CGEventFlags::MaskAlternate) {
+                        if !m.intersects(Modifiers::OPT) { m |= Modifiers::OPT_LEFT; }
+                    } else { m &= !(Modifiers::OPT_LEFT | Modifiers::OPT_RIGHT); }
+                    state.current_modifiers = m;
+                }
+
                 // Check if this is a lock key (e.g., Caps Lock) which comes through
                 // as FlagsChanged but isn't a traditional modifier
                 let lock_key = keycode_to_key(keycode);
@@ -289,10 +312,25 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         changed_modifier: None,
                     });
                 } else if let Some(modifier_bit) = changed_modifier {
-                    // Regular modifier key — use keycode to toggle the specific bit
-                    let was_set = state.current_modifiers.contains(modifier_bit);
-                    let is_key_down = !was_set;
-
+                    // Derive press/release from the event flags instead of inferring it from the
+                    // tracked state. The previous `!was_set` toggle stayed inverted forever once a
+                    // release event was missed, and FN (keycode 0x3F) also reaches this branch, so
+                    // it has to be resolved through `flags_have_fn` — otherwise it always falls
+                    // through to `false` and is reported as released.
+                    let group_in_flags = if modifier_bit.intersects(Modifiers::CMD) {
+                        flags.contains(CGEventFlags::MaskCommand)
+                    } else if modifier_bit.intersects(Modifiers::SHIFT) {
+                        flags.contains(CGEventFlags::MaskShift)
+                    } else if modifier_bit.intersects(Modifiers::CTRL) {
+                        flags.contains(CGEventFlags::MaskControl)
+                    } else if modifier_bit.intersects(Modifiers::OPT) {
+                        flags.contains(CGEventFlags::MaskAlternate)
+                    } else if modifier_bit.intersects(Modifiers::FN) {
+                        flags_have_fn(flags)
+                    } else {
+                        false
+                    };
+                    let is_key_down = group_in_flags;
                     if is_key_down {
                         state.current_modifiers |= modifier_bit;
                     } else {
